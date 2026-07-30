@@ -137,13 +137,19 @@ class Ark(models.Model):
             raise ValidationError(f"expected {expected_ark} got {self.ark}")
     
     @classmethod
-    def create(cls, naan: Naan, shoulder: Shoulder):
+    def create(cls, naan: Naan, shoulder: Shoulder, name_prefix: str = ""):
+        """Build an unsaved Ark whose name is `name_prefix` plus a random NOID.
+
+        `name_prefix` sits between the shoulder and the generated NOID, so the
+        check digit and the caller's collision retries keep working exactly as
+        they do for a fully generated name.
+        """
         noid = generate_noid(env("ARKLET_NOID_LENGTH"))
-        ark_prefix = f"{naan.naan}{shoulder.shoulder}"
+        ark_prefix = f"{naan.naan}{shoulder.shoulder}{name_prefix}"
         base_ark_string = f"{ark_prefix}{noid}"
         check_digit = noid_check_digit(base_ark_string)
-        assigned_name = f"{noid}{check_digit}"
-        ark_string = f"{ark_prefix}{assigned_name}"
+        assigned_name = f"{name_prefix}{noid}{check_digit}"
+        ark_string = f"{naan.naan}{shoulder.shoulder}{assigned_name}"
 
         return Ark(
             ark=ark_string,

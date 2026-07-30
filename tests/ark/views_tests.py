@@ -9,7 +9,8 @@ import pytest
 from django.core.exceptions import ValidationError
 
 from ark.models import Ark, Key, Naan, Shoulder
-from ark.utils import parse_ark
+from ark.utils import noid_check_digit, parse_ark
+from arklet.settings import env
 
 
 @dataclass
@@ -235,6 +236,137 @@ def other_naan(db):
     )
 
 
+class TestNamePrefix:
+    """Test minting names shaped as <shoulder><name_prefix><random>."""
+
+    @staticmethod
+    def _assert_valid_name(minted_ark, naan, shoulder, name_prefix):
+        """The random part must be intact and the check digit must still verify."""
+        _, minted_naan, assigned_name = parse_ark(minted_ark)
+        assert minted_naan == naan.naan
+        expected_prefix = f"{shoulder.shoulder.lstrip('/')}{name_prefix}"
+        assert assigned_name.startswith(expected_prefix)
+
+        noid_length = env("ARKLET_NOID_LENGTH")
+        random_part = assigned_name[len(expected_prefix):]
+        assert len(random_part) == noid_length + 1  # noid + check digit
+        noid, check_digit = random_part[:-1], random_part[-1]
+        base = f"{naan.naan}{shoulder.shoulder}{name_prefix}{noid}"
+        assert noid_check_digit(base) == check_digit
+
+    @pytest.mark.django_db
+    def test_nested_shoulder_gives_hierarchical_name(
+        self, client, mint_ark_args, naan, nested_shoulder
+    ) -> None:
+        """A multi-segment shoulder yields naan/prefix/prefix/random."""
+        mint_ark_args.data["shoulder"] = nested_shoulder.shoulder
+        res = client.post(**asdict(mint_ark_args))
+        assert res.status_code == 200
+        minted_ark = res.json()["ark"]
+        assert minted_ark.startswith("ark:/1/jc2/nii/")
+        self._assert_valid_name(minted_ark, naan, nested_shoulder, "")
+
+    @pytest.mark.django_db
+    def test_name_prefix_is_prepended_to_random_part(
+        self, client, mint_ark_args, naan, shoulder
+    ) -> None:
+        """name_prefix sits between the shoulder and the generated NOID."""
+        mint_ark_args.data["name_prefix"] = "2026"
+        res = client.post(**asdict(mint_ark_args))
+        assert res.status_code == 200
+        minted_ark = res.json()["ark"]
+        assert minted_ark.startswith("ark:/1/t22026")
+        self._assert_valid_name(minted_ark, naan, shoulder, "2026")
+
+    @pytest.mark.django_db
+    def test_name_prefix_may_add_hierarchy(
+        self, client, mint_ark_args, naan, nested_shoulder
+    ) -> None:
+        """A name_prefix can add further slash-separated levels at runtime."""
+        mint_ark_args.data["shoulder"] = nested_shoulder.shoulder
+        mint_ark_args.data["name_prefix"] = "2026/thesis/"
+        res = client.post(**asdict(mint_ark_args))
+        assert res.status_code == 200
+        minted_ark = res.json()["ark"]
+        assert minted_ark.startswith("ark:/1/jc2/nii/2026/thesis/")
+        self._assert_valid_name(minted_ark, naan, nested_shoulder, "2026/thesis/")
+
+    @pytest.mark.django_db
+    def test_name_prefix_is_persisted_in_assigned_name(
+        self, client, mint_ark_args
+    ) -> None:
+        """The prefix belongs to assigned_name, keeping Ark.clean() consistent."""
+        mint_ark_args.data["name_prefix"] = "2026"
+        res = client.post(**asdict(mint_ark_args))
+        ark_obj = Ark.objects.get(ark=res.json()["ark"].removeprefix("ark:/"))
+        assert ark_obj.assigned_name.startswith("2026")
+        ark_obj.clean()  # raises ValidationError if the ark string disagrees
+
+    @pytest.mark.django_db
+    def test_omitting_name_prefix_is_unchanged(
+        self, client, mint_ark_args, naan, shoulder
+    ) -> None:
+        """Existing clients that send no name_prefix are unaffected."""
+        res = client.post(**asdict(mint_ark_args))
+        assert res.status_code == 200
+        self._assert_valid_name(res.json()["ark"], naan, shoulder, "")
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        "bad_prefix",
+        [
+            "/leading-slash",
+            "double//slash",
+            "trailing..dots",
+            "space in prefix",
+            "unicode日本語",
+            "x" * 41,
+        ],
+    )
+    def test_invalid_name_prefix_is_bad_request(
+        self, client, mint_ark_args, bad_prefix
+    ) -> None:
+        """An unusable name_prefix is refused rather than minted."""
+        mint_ark_args.data["name_prefix"] = bad_prefix
+        res = client.post(**asdict(mint_ark_args))
+        assert res.status_code == 400
+        assert not Ark.objects.exists()
+
+    @pytest.mark.django_db(transaction=True)
+    @patch("ark.models.generate_noid")
+    def test_collision_retry_still_applies_with_name_prefix(
+        self, mock_noid_gen, caplog, client, mint_ark_args, naan, shoulder
+    ) -> None:
+        """A prefixed name keeps the random part, so retrying still resolves collisions."""
+        # pylint: disable=too-many-arguments
+        colliding_noid = "12345678"
+        base = f"{naan.naan}{shoulder.shoulder}2026{colliding_noid}"
+        colliding_ark = Ark.objects.create(
+            ark=f"{base}{noid_check_digit(base)}",
+            naan=naan,
+            shoulder=shoulder,
+            assigned_name=f"2026{colliding_noid}{noid_check_digit(base)}",
+            url="https://example.com/original",
+        )
+        non_colliding = (str(i) for i in count(100_000_000))
+        return_values = chain([colliding_noid], non_colliding)
+        mock_noid_gen.side_effect = lambda noid_length: next(return_values)
+
+        mint_ark_args.data["name_prefix"] = "2026"
+        res = client.post(**asdict(mint_ark_args))
+        # Then minting succeeds without touching the colliding ark
+        assert res.status_code == 200
+        assert Ark.objects.count() == 2
+        assert res.json()["ark"] != f"ark:/{colliding_ark.ark}"
+        colliding_ark.refresh_from_db()
+        assert colliding_ark.url == "https://example.com/original"
+        # And the collision is logged as a warning
+        assert any(
+            record for record in caplog.records
+            if record.msg == "Ark created after %d collision(s)"
+        )
+
+
 class TestShoulderIsScopedToNaan:
     """A shoulder registered under one NAAN must not be usable by another."""
 
@@ -262,6 +394,53 @@ class TestShoulderIsScopedToNaan:
         res = client.post(
             path="/bulk_mint",
             data={"naan": naan.naan, "data": [{"shoulder": "/x9"}]},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=auth,
+        )
+        assert res.status_code == 400
+        assert not Ark.objects.exists()
+
+
+class TestBulkMintNamePrefix:
+    """Test per-record name prefixes in bulk_mint."""
+
+    @pytest.mark.django_db
+    def test_per_record_name_prefix(self, client, naan, shoulder, auth) -> None:
+        """Each record in a batch can carry its own prefix."""
+        res = client.post(
+            path="/bulk_mint",
+            data={
+                "naan": naan.naan,
+                "data": [
+                    {"shoulder": shoulder.shoulder, "name_prefix": "2025"},
+                    {"shoulder": shoulder.shoulder, "name_prefix": "2026"},
+                    {"shoulder": shoulder.shoulder},
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=auth,
+        )
+        assert res.status_code == 200
+        assert res.json()["num_received"] == 3
+        names = sorted(a.assigned_name for a in Ark.objects.all())
+        assert len(names) == 3
+        assert sum(n.startswith("2025") for n in names) == 1
+        assert sum(n.startswith("2026") for n in names) == 1
+
+    @pytest.mark.django_db
+    def test_invalid_name_prefix_rejects_whole_batch(
+        self, client, naan, shoulder, auth
+    ) -> None:
+        """One bad prefix fails the batch instead of minting part of it."""
+        res = client.post(
+            path="/bulk_mint",
+            data={
+                "naan": naan.naan,
+                "data": [
+                    {"shoulder": shoulder.shoulder, "name_prefix": "2026"},
+                    {"shoulder": shoulder.shoulder, "name_prefix": "/bad"},
+                ],
+            },
             content_type="application/json",
             HTTP_AUTHORIZATION=auth,
         )
