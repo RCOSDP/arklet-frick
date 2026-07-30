@@ -6,6 +6,7 @@ from itertools import chain, count
 from unittest.mock import patch
 
 import pytest
+from django.core.exceptions import ValidationError
 
 from ark.models import Ark, Key, Naan, Shoulder
 from ark.utils import parse_ark
@@ -42,9 +43,13 @@ def shoulder(db, naan):
 
 @pytest.fixture
 def auth(db, naan):
-    """Create an access key for the initial naan."""
-    key = Key.objects.create(naan=naan, active=True)
-    return f"Bearer {key.key}"
+    """Create an access key for the initial naan.
+
+    Keys are stored hashed, so the bearer token is the raw api key returned by
+    create_for_naan, not the persisted Key.key value.
+    """
+    _, api_key = Key.create_for_naan(naan.naan)
+    return f"Bearer {api_key}"
 
 
 @pytest.fixture
@@ -136,12 +141,16 @@ class TestMintArk:
         assert res.status_code == 403
 
     def test_verify_key_is_valid(self, client, mint_ark_args) -> None:
-        """mint_ark requires an uuid4 as the key."""
+        """mint_ark rejects a key that isn't a uuid4.
+
+        Keys are compared as hashed passwords, so a malformed key is simply not
+        a match and is refused without disclosing why.
+        """
         # When the authorization header value isn't a UUID4
         mint_ark_args.HTTP_AUTHORIZATION = "Bearer not-a-uuid4"
         res = client.post(**asdict(mint_ark_args))
-        # Then we get a 400 Bad Request
-        assert res.status_code == 400
+        # Then we get a 403 Forbidden
+        assert res.status_code == 403
 
     def test_authorized_naan_matches_post_naan(self, client, mint_ark_args) -> None:
         """mint_ark NAAN in auth header matches NAAN in POST body."""
@@ -152,7 +161,7 @@ class TestMintArk:
         assert res.status_code == 403
 
     @pytest.mark.django_db(transaction=True)
-    @patch("ark.views.generate_noid")
+    @patch("ark.models.generate_noid")
     def test_fails_after_too_many_collisions(
         self, mock_noid_gen, caplog, client, mint_ark_args, ark
     ) -> None:
@@ -164,8 +173,9 @@ class TestMintArk:
         within the test. `transaction=True` is equivalent to Django
         TransactionTestCase. `transaction=False` is equivalent to Django TestCase.
 
-        We patch ark.views.generate_noid (even though generate_noid is originally
-        defined in ark.utils) because it is imported directly into ark.views.
+        We patch ark.models.generate_noid (even though generate_noid is originally
+        defined in ark.utils) because Ark.create imports it directly into
+        ark.models.
         """
         # pylint: disable=too-many-arguments
         # When mint_ark keeps creating NOIDs that collide with an existing ARK
@@ -179,7 +189,7 @@ class TestMintArk:
         assert res.status_code == 500
 
     @pytest.mark.django_db(transaction=True)
-    @patch("ark.views.generate_noid")
+    @patch("ark.models.generate_noid")
     def test_succeeds_on_single_collision(
         self, mock_noid_gen, caplog, client, mint_ark_args, ark
     ) -> None:
@@ -204,3 +214,157 @@ class TestMintArk:
         msg = "Ark created after %d collision(s)"
         assert any(record for record in caplog.records if record.msg == msg)
         self._validate_success(mint_ark_args, res)
+
+
+@pytest.fixture
+def nested_shoulder(db, naan):
+    """Create a multi-segment shoulder, e.g. ark:/1/jc2/nii/<noid>.
+
+    A trailing slash is what separates the shoulder from the generated name.
+    """
+    return Shoulder.objects.create(
+        shoulder="/jc2/nii/", naan=naan, name="Nested", description="A Shoulder"
+    )
+
+
+@pytest.fixture
+def other_naan(db):
+    """Create a second NAAN, used to test cross-NAAN isolation."""
+    return Naan.objects.create(
+        naan=2, name="Other", description="Another NAAN", url="https://other.example.com"
+    )
+
+
+class TestShoulderIsScopedToNaan:
+    """A shoulder registered under one NAAN must not be usable by another."""
+
+    @pytest.mark.django_db
+    def test_mint_rejects_shoulder_of_another_naan(
+        self, client, mint_ark_args, other_naan
+    ) -> None:
+        """mint_ark refuses a shoulder that belongs to a different NAAN."""
+        foreign = Shoulder.objects.create(
+            shoulder="/x9", naan=other_naan, name="Foreign", description="Other NAAN"
+        )
+        mint_ark_args.data["shoulder"] = foreign.shoulder
+        res = client.post(**asdict(mint_ark_args))
+        assert res.status_code == 400
+        assert not Ark.objects.exists()
+
+    @pytest.mark.django_db
+    def test_bulk_mint_rejects_shoulder_of_another_naan(
+        self, client, naan, auth, other_naan
+    ) -> None:
+        """bulk_mint refuses a shoulder that belongs to a different NAAN."""
+        Shoulder.objects.create(
+            shoulder="/x9", naan=other_naan, name="Foreign", description="Other NAAN"
+        )
+        res = client.post(
+            path="/bulk_mint",
+            data={"naan": naan.naan, "data": [{"shoulder": "/x9"}]},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=auth,
+        )
+        assert res.status_code == 400
+        assert not Ark.objects.exists()
+
+
+class TestResolveLongestPrefix:
+    """Test suffix passthrough when several ancestors of an ARK are registered."""
+
+    @staticmethod
+    def _create_ark(naan, shoulder, assigned_name, url):
+        return Ark.objects.create(
+            ark=f"{naan.naan}{shoulder.shoulder}{assigned_name}",
+            naan=naan,
+            shoulder=shoulder,
+            assigned_name=assigned_name,
+            url=url,
+        )
+
+    @pytest.mark.django_db
+    def test_version_suffix_uses_nearest_ancestor(
+        self, client, naan, nested_shoulder
+    ) -> None:
+        """A /v2 suffix resolves against the item, not a shorter ancestor ark."""
+        # Given a collection-level ARK and an item-level ARK beneath it, so that
+        # the requested ark has two registered ancestors
+        self._create_ark(naan, nested_shoulder, "col5", "https://example.com/collection")
+        item = self._create_ark(
+            naan, nested_shoulder, "col5/k3n7q9wb2", "https://example.com/item"
+        )
+        # When resolving an unregistered version of the item
+        res = client.get(f"/ark:/{item.ark}/v2")
+        # Then we are redirected to the item, with the suffix passed through
+        assert res.status_code == 302
+        assert res.url == "https://example.com/item/v2"
+
+    @pytest.mark.django_db
+    def test_unregistered_intermediate_level_falls_back(
+        self, client, naan, nested_shoulder
+    ) -> None:
+        """With no item-level ARK, the collection-level ARK still answers."""
+        collection = self._create_ark(
+            naan, nested_shoulder, "col5", "https://example.com/collection"
+        )
+        res = client.get(f"/ark:/{collection.ark}/k3n7q9wb2/v2")
+        assert res.status_code == 302
+        assert res.url == "https://example.com/collection/k3n7q9wb2/v2"
+
+    @pytest.mark.django_db
+    def test_exact_match_is_preferred_over_prefix(
+        self, client, naan, nested_shoulder
+    ) -> None:
+        """A registered version ARK resolves to its own url."""
+        self._create_ark(
+            naan, nested_shoulder, "col5/k3n7q9wb2", "https://example.com/item"
+        )
+        version = self._create_ark(
+            naan, nested_shoulder, "col5/k3n7q9wb2/v2", "https://example.com/item-v2"
+        )
+        res = client.get(f"/ark:/{version.ark}")
+        assert res.status_code == 302
+        assert res.url.startswith("https://example.com/item-v2")
+
+    @pytest.mark.django_db
+    def test_suffix_on_url_less_ancestor_shows_metadata(
+        self, client, naan, nested_shoulder
+    ) -> None:
+        """A suffix cannot pass through an ark that has no url registered."""
+        # Given an ark reserved without a target url
+        reserved = self._create_ark(naan, nested_shoulder, "col5", "")
+        reserved.title = "Reserved collection"
+        reserved.save()
+        # When resolving a suffixed form of it
+        res = client.get(f"/ark:/{reserved.ark}/v2")
+        # Then we describe the ancestor rather than redirecting to a bare suffix
+        assert res.status_code == 200
+        assert "Reserved collection" in res.content.decode()
+        assert reserved.ark in res.content.decode()
+
+    @pytest.mark.django_db
+    def test_url_less_exact_match_shows_metadata(
+        self, client, naan, nested_shoulder
+    ) -> None:
+        """An ark with no url resolves to arklet's own metadata page."""
+        reserved = self._create_ark(naan, nested_shoulder, "col5", "")
+        res = client.get(f"/ark:/{reserved.ark}")
+        assert res.status_code == 200
+        assert reserved.ark in res.content.decode()
+
+
+class TestArkInvariant:
+    """Test the invariant Ark.clean() enforces on the ark string."""
+
+    @pytest.mark.django_db
+    def test_created_ark_passes_clean(self, naan, shoulder) -> None:
+        """Ark.clean() agrees with the ark string Ark.create() builds."""
+        Ark.create(naan, shoulder).clean()
+
+    @pytest.mark.django_db
+    def test_clean_rejects_mismatched_ark(self, naan, shoulder) -> None:
+        """Ark.clean() still catches an ark string that disagrees with its parts."""
+        ark = Ark.create(naan, shoulder)
+        ark.assigned_name = "tampered"
+        with pytest.raises(ValidationError):
+            ark.clean()

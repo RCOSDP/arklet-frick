@@ -67,20 +67,25 @@ def mint_ark(request):
         return HttpResponseForbidden()
 
     shoulder = mint_request.cleaned_data.pop("shoulder")
-    shoulder_obj = Shoulder.objects.filter(shoulder=shoulder).first()
+    shoulder_obj = Shoulder.objects.filter(
+        shoulder=shoulder, naan=authorized_naan
+    ).first()
     if shoulder_obj is None:
         return HttpResponseBadRequest(f"Shoulder {shoulder} does not exist")
 
     ark, collisions = None, 0
-    for _ in range(10):
+    for _ in range(COLLISIONS):
+        candidate = Ark.create(authorized_naan, shoulder_obj)
+        candidate.set_fields(mint_request.cleaned_data)
         try:
-            ark = Ark.create(authorized_naan, shoulder_obj)
-            ark.set_fields(mint_request.cleaned_data)
-            ark.save()
-            break
+            # force_insert, or saving over an existing name would silently
+            # overwrite that ark instead of registering the collision.
+            candidate.save(force_insert=True)
         except IntegrityError:
             collisions += 1
             continue
+        ark = candidate
+        break
 
     if not ark:
         msg = f"Gave up creating ark after {collisions} collision(s)"
@@ -151,9 +156,19 @@ def resolve_ark(request, ark: str):
     else:
         # Ark not found. Try to find an ark that is a prefix.
         prefixes = [f"{naan}/{a}" for a in gen_prefixes(identifier)]
-        # Get the one with the longest prefix
-        ark_prefix = Ark.objects.filter(ark__in=prefixes).order_by(Length('ark')).first()
+        # Get the one with the longest prefix, so that a nested ark (e.g. an
+        # item under a collection) wins over its shorter ancestors.
+        ark_prefix = (
+            Ark.objects.filter(ark__in=prefixes)
+            .order_by(Length('ark').desc())
+            .first()
+        )
         if ark_prefix:
+            if not ark_prefix.url:
+                # No target to pass the suffix through to, so describe the
+                # nearest registered ancestor instead of redirecting to a
+                # relative path built from an empty url.
+                return view_ark(request, ark_prefix)
             suffix = ark_str.removeprefix(ark_prefix.ark)
             return HttpResponseRedirect(ark_prefix.url + suffix)
         else:
@@ -296,7 +311,7 @@ def batch_mint_arks(request):
         shoulders.add(d['shoulder'])
     shoulder_objs = dict()
     for s in shoulders:
-        shoulder_obj = Shoulder.objects.filter(shoulder=s).first()
+        shoulder_obj = Shoulder.objects.filter(shoulder=s, naan=authorized_naan).first()
         if shoulder_obj is None:
             return HttpResponseBadRequest(f"shoulder {s} does not exist")
         shoulder_objs[s] = shoulder_obj

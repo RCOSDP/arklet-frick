@@ -131,7 +131,8 @@ class Ark(models.Model):
     }
 
     def clean(self):
-        expected_ark = f"{self.naan.naan}{self.shoulder}{self.assigned_name}"
+        # Shoulder.__str__ already includes the naan, so use the raw column here
+        expected_ark = f"{self.naan.naan}{self.shoulder.shoulder}{self.assigned_name}"
         if self.ark != expected_ark:
             raise ValidationError(f"expected {expected_ark} got {self.ark}")
     
