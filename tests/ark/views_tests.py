@@ -238,23 +238,39 @@ def other_naan(db):
     )
 
 
-class TestNamePrefix:
-    """Test minting names shaped as <shoulder><name_prefix><random>."""
+class TestMintedName:
+    """Test the shape of a minted name: shoulder, then NOID and check digit."""
 
     @staticmethod
-    def _assert_valid_name(minted_ark, naan, shoulder, name_prefix):
-        """The random part must be intact and the check digit must still verify."""
-        _, minted_naan, assigned_name = parse_ark(minted_ark)
-        assert minted_naan == naan.naan
-        expected_prefix = f"{shoulder.shoulder.lstrip('/')}{name_prefix}"
-        assert assigned_name.startswith(expected_prefix)
+    def _blade(minted_ark, naan, shoulder):
+        """Return the part of the name that follows the shoulder.
 
-        noid_length = env("ARKLET_NOID_LENGTH")
-        random_part = assigned_name[len(expected_prefix):]
-        assert len(random_part) == noid_length + 1  # noid + check digit
-        noid, check_digit = random_part[:-1], random_part[-1]
-        base = f"{naan.naan}{shoulder.shoulder}{name_prefix}{noid}"
+        parse_ark reports everything after the NAAN, so the shoulder has to be
+        taken off before the generated name can be inspected.
+        """
+        _, minted_naan, name = parse_ark(minted_ark)
+        assert minted_naan == naan.naan
+        expected_shoulder = shoulder.shoulder.lstrip("/")
+        assert name.startswith(expected_shoulder)
+        return name[len(expected_shoulder):]
+
+    @classmethod
+    def _assert_valid_name(cls, minted_ark, naan, shoulder):
+        """The name must be exactly a NOID plus a verifying check digit."""
+        blade = cls._blade(minted_ark, naan, shoulder)
+        assert len(blade) == env("ARKLET_NOID_LENGTH") + 1  # noid + check digit
+        noid, check_digit = blade[:-1], blade[-1]
+        base = f"{naan.naan}{shoulder.shoulder}{noid}"
         assert noid_check_digit(base) == check_digit
+
+    @pytest.mark.django_db
+    def test_name_is_a_noid_and_its_check_digit(
+        self, client, mint_ark_args, naan, shoulder
+    ) -> None:
+        """Nothing precedes the generated name, so it carries no meaning."""
+        res = client.post(**asdict(mint_ark_args))
+        assert res.status_code == 200
+        self._assert_valid_name(res.json()["ark"], naan, shoulder)
 
     @pytest.mark.django_db
     def test_second_shoulder_divides_the_namespace(
@@ -267,100 +283,44 @@ class TestNamePrefix:
         minted_ark = res.json()["ark"]
         # The blade follows the shoulder directly, with no separator between
         assert minted_ark.startswith("ark:/1/c5")
-        self._assert_valid_name(minted_ark, naan, nested_shoulder, "")
+        self._assert_valid_name(minted_ark, naan, nested_shoulder)
 
     @pytest.mark.django_db
-    def test_name_prefix_is_prepended_to_random_part(
+    def test_a_caller_cannot_prepend_to_the_name(
         self, client, mint_ark_args, naan, shoulder
     ) -> None:
-        """name_prefix sits between the shoulder and the generated NOID."""
-        mint_ark_args.data["name_prefix"] = "2026"
-        res = client.post(**asdict(mint_ark_args))
-        assert res.status_code == 200
-        minted_ark = res.json()["ark"]
-        assert minted_ark.startswith("ark:/1/t22026")
-        self._assert_valid_name(minted_ark, naan, shoulder, "2026")
+        """A caller has no way to put its own characters in front of the name.
 
-    @pytest.mark.django_db
-    def test_name_prefix_may_not_add_hierarchy(
-        self, client, mint_ark_args, nested_shoulder
-    ) -> None:
-        """A name_prefix may not smuggle a hierarchy into the blade.
-
-        A '/' inside the name would falsely imply that the part before it names
-        a real object containing this one.
+        Anything accepted here would be read as meaning by whoever sees the
+        ark, and a namespace is divided by registering a shoulder instead.
         """
-        mint_ark_args.data["shoulder"] = nested_shoulder.shoulder
-        mint_ark_args.data["name_prefix"] = "2026/thesis/"
-        res = client.post(**asdict(mint_ark_args))
-        assert res.status_code == 400
-        assert not Ark.objects.exists()
-
-    @pytest.mark.django_db
-    def test_name_prefix_is_persisted_in_assigned_name(
-        self, client, mint_ark_args
-    ) -> None:
-        """The prefix belongs to assigned_name, keeping Ark.clean() consistent."""
         mint_ark_args.data["name_prefix"] = "2026"
         res = client.post(**asdict(mint_ark_args))
-        ark_obj = Ark.objects.get(ark=res.json()["ark"].removeprefix("ark:/"))
-        assert ark_obj.assigned_name.startswith("2026")
-        ark_obj.clean()  # raises ValidationError if the ark string disagrees
-
-    @pytest.mark.django_db
-    def test_omitting_name_prefix_is_unchanged(
-        self, client, mint_ark_args, naan, shoulder
-    ) -> None:
-        """Existing clients that send no name_prefix are unaffected."""
-        res = client.post(**asdict(mint_ark_args))
         assert res.status_code == 200
-        self._assert_valid_name(res.json()["ark"], naan, shoulder, "")
-
-    @pytest.mark.django_db
-    @pytest.mark.parametrize(
-        "bad_prefix",
-        [
-            "/leading-slash",
-            "double//slash",
-            "trailing..dots",
-            "space in prefix",
-            "unicode日本語",
-            "x" * 41,
-            "one/level",  # '/' opens the qualifier region, it is not part of a name
-            "one.variant",  # '.' likewise marks a variant, not a name
-            "one-two",  # hyphens are insignificant and would not survive lookup
-        ],
-    )
-    def test_invalid_name_prefix_is_bad_request(
-        self, client, mint_ark_args, bad_prefix
-    ) -> None:
-        """An unusable name_prefix is refused rather than minted."""
-        mint_ark_args.data["name_prefix"] = bad_prefix
-        res = client.post(**asdict(mint_ark_args))
-        assert res.status_code == 400
-        assert not Ark.objects.exists()
+        blade = self._blade(res.json()["ark"], naan, shoulder)
+        assert not blade.startswith("2026")
+        assert len(blade) == env("ARKLET_NOID_LENGTH") + 1
 
     @pytest.mark.django_db(transaction=True)
     @patch("ark.models.generate_noid")
-    def test_collision_retry_still_applies_with_name_prefix(
+    def test_collision_retry_keeps_the_registered_ark(
         self, mock_noid_gen, caplog, client, mint_ark_args, naan, shoulder
     ) -> None:
-        """A prefixed name keeps the random part, so retrying still resolves collisions."""
+        """A NOID collision retries rather than retargeting the stored ark."""
         # pylint: disable=too-many-arguments
         colliding_noid = "12345678"
-        base = f"{naan.naan}{shoulder.shoulder}2026{colliding_noid}"
+        base = f"{naan.naan}{shoulder.shoulder}{colliding_noid}"
         colliding_ark = Ark.objects.create(
             ark=f"{base}{noid_check_digit(base)}",
             naan=naan,
             shoulder=shoulder,
-            assigned_name=f"2026{colliding_noid}{noid_check_digit(base)}",
+            assigned_name=f"{colliding_noid}{noid_check_digit(base)}",
             url="https://example.com/original",
         )
         non_colliding = (str(i) for i in count(100_000_000))
         return_values = chain([colliding_noid], non_colliding)
         mock_noid_gen.side_effect = lambda noid_length: next(return_values)
 
-        mint_ark_args.data["name_prefix"] = "2026"
         res = client.post(**asdict(mint_ark_args))
         # Then minting succeeds without touching the colliding ark
         assert res.status_code == 200
@@ -409,12 +369,14 @@ class TestShoulderIsScopedToNaan:
         assert not Ark.objects.exists()
 
 
-class TestBulkMintNamePrefix:
-    """Test per-record name prefixes in bulk_mint."""
+class TestBulkMintNames:
+    """Test that a batch mints names the same way a single request does."""
 
     @pytest.mark.django_db
-    def test_per_record_name_prefix(self, client, naan, shoulder, auth) -> None:
-        """Each record in a batch can carry its own prefix."""
+    def test_every_record_gets_a_generated_name(
+        self, client, naan, shoulder, auth
+    ) -> None:
+        """No record in a batch can carry its own prefix into the name."""
         res = client.post(
             path="/bulk_mint",
             data={
@@ -430,30 +392,11 @@ class TestBulkMintNamePrefix:
         )
         assert res.status_code == 200
         assert res.json()["num_received"] == 3
-        names = sorted(a.assigned_name for a in Ark.objects.all())
+        names = [a.assigned_name for a in Ark.objects.all()]
         assert len(names) == 3
-        assert sum(n.startswith("2025") for n in names) == 1
-        assert sum(n.startswith("2026") for n in names) == 1
-
-    @pytest.mark.django_db
-    def test_invalid_name_prefix_rejects_whole_batch(
-        self, client, naan, shoulder, auth
-    ) -> None:
-        """One bad prefix fails the batch instead of minting part of it."""
-        res = client.post(
-            path="/bulk_mint",
-            data={
-                "naan": naan.naan,
-                "data": [
-                    {"shoulder": shoulder.shoulder, "name_prefix": "2026"},
-                    {"shoulder": shoulder.shoulder, "name_prefix": "/bad"},
-                ],
-            },
-            content_type="application/json",
-            HTTP_AUTHORIZATION=auth,
-        )
-        assert res.status_code == 400
-        assert not Ark.objects.exists()
+        expected = env("ARKLET_NOID_LENGTH") + 1
+        assert all(len(n) == expected for n in names)
+        assert not any(n.startswith("2025") or n.startswith("2026") for n in names)
 
 
 class TestResolveLongestPrefix:

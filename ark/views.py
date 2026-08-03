@@ -18,7 +18,7 @@ from django.http import (
 from django.views.decorators.csrf import csrf_exempt
 from django.shortcuts import render
 
-from ark.forms import MintArkForm, UpdateArkForm, validate_name_prefix
+from ark.forms import MintArkForm, UpdateArkForm
 from ark.models import Ark, Naan, Key, Shoulder
 from ark.utils import (
     gen_prefixes,
@@ -79,11 +79,9 @@ def mint_ark(request):
     if shoulder_obj is None:
         return HttpResponseBadRequest(f"Shoulder {shoulder} does not exist")
 
-    name_prefix = mint_request.cleaned_data.pop("name_prefix", "")
-
     ark, collisions = None, 0
     for _ in range(COLLISIONS):
-        candidate = Ark.create(authorized_naan, shoulder_obj, name_prefix)
+        candidate = Ark.create(authorized_naan, shoulder_obj)
         candidate.set_fields(mint_request.cleaned_data)
         try:
             # force_insert, or saving over an existing name would silently
@@ -366,11 +364,6 @@ def batch_mint_arks(request):
         if 'shoulder' not in d:
             return HttpResponseBadRequest("shoulder value must be present in every record")
         shoulders.add(d['shoulder'])
-        if d.get('name_prefix'):
-            try:
-                validate_name_prefix(d['name_prefix'])
-            except ValidationError as e:
-                return HttpResponseBadRequest("; ".join(e.messages))
     shoulder_objs = dict()
     for s in shoulders:
         shoulder_obj = Shoulder.objects.filter(shoulder=s, naan=authorized_naan).first()
@@ -385,9 +378,7 @@ def batch_mint_arks(request):
             new_arks = []
             for record in records:
                 shoulder = shoulder_objs[record['shoulder']]
-                new_ark = Ark.create(
-                    authorized_naan, shoulder, record.get('name_prefix', '')
-                )
+                new_ark = Ark.create(authorized_naan, shoulder)
                 new_ark.set_fields(record)
                 new_arks.append(new_ark)
             created = Ark.objects.bulk_create(new_arks)

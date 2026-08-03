@@ -5,13 +5,6 @@ from django.core.exceptions import ValidationError
 
 from ark.utils import parse_ark
 
-# A name prefix extends the blade, so it must not contain a separator: '/' and
-# '.' are reserved to open the qualifier region that follows a base name, and
-# hyphens are insignificant and would not survive comparison. Namespaces belong
-# in the shoulder, not here.
-NAME_PREFIX_PATTERN = re.compile(r"^[0-9A-Za-z]+$")
-NAME_PREFIX_MAX_LENGTH = 40
-
 # A shoulder is a sub-namespace of the NAAN. By convention it runs from the end
 # of the NAAN up to and including its first digit, which is how a reader finds
 # where the shoulder stops and the blade begins without a visual separator. It
@@ -37,20 +30,6 @@ def validate_shoulder(shoulder: str):
         )
 
 
-def validate_name_prefix(name_prefix: str):
-    """Validate a caller-supplied prefix for the assigned name."""
-    if len(name_prefix) > NAME_PREFIX_MAX_LENGTH:
-        raise ValidationError(
-            f"Name prefixes are limited to {NAME_PREFIX_MAX_LENGTH} characters"
-        )
-    if not NAME_PREFIX_PATTERN.match(name_prefix):
-        raise ValidationError(
-            "Name prefixes must be alphanumeric with no separators. Use a "
-            "shoulder to divide a namespace, and the qualifier region after "
-            "the base name to express containment."
-        )
-
-
 def validate_ark(ark: str):
     try:
         parse_ark(ark)
@@ -61,7 +40,6 @@ def validate_ark(ark: str):
 class MintArkForm(forms.Form):
     naan = forms.IntegerField()
     shoulder = forms.CharField(validators=[validate_shoulder])
-    name_prefix = forms.CharField(required=False, validators=[validate_name_prefix])
     url = forms.URLField(required=False)
     metadata = forms.CharField(required=False)
     title = forms.CharField(required=False)
