@@ -7,6 +7,9 @@
 
 <body>
     <h1>Ark {{ ark }}</h1>
+    {% if inherited_from %}
+        <p><em>Metadata inherited from ark:/{{ inherited_from }} (suffix: {{ suffix }})</em></p>
+    {% endif %}
     <p>
         <a href="{{ url }}">{{ url }}</a>, {{ label }}
     </p>

@@ -20,7 +20,13 @@ from django.shortcuts import render
 
 from ark.forms import MintArkForm, UpdateArkForm, validate_name_prefix
 from ark.models import Ark, Naan, Key, Shoulder
-from ark.utils import parse_ark, gen_prefixes, parse_ark_lookup
+from ark.utils import (
+    gen_prefixes,
+    parse_ark,
+    parse_ark_lookup,
+    split_after_normalized,
+    strip_hyphens,
+)
 from arklet.settings import env
 
 COLLISIONS = 10
@@ -146,7 +152,13 @@ def resolve_ark(request, ark: str):
         return HttpResponseBadRequest(e)
 
     ark_str = f"{naan}/{identifier}"
+    # Hyphens are insignificant, so an ark that picked one up in transit still
+    # has to find its record. Stored arks are matched first so that a legacy
+    # record containing a hyphen keeps resolving.
+    normalized = strip_hyphens(identifier)
     ark_obj = Ark.objects.filter(ark=ark_str).first()
+    if ark_obj is None and normalized != identifier:
+        ark_obj = Ark.objects.filter(ark=f"{naan}/{normalized}").first()
     if ark_obj:
         if info_inflection:
             return view_ark(request, ark_obj)
@@ -157,7 +169,7 @@ def resolve_ark(request, ark: str):
         return HttpResponseRedirect(ark_obj.url + '?' + request.META['QUERY_STRING'])
     else:
         # Ark not found. Try to find an ark that is a prefix.
-        prefixes = [f"{naan}/{a}" for a in gen_prefixes(identifier)]
+        prefixes = [f"{naan}/{a}" for a in gen_prefixes(normalized)]
         # Get the one with the longest prefix, so that a nested ark (e.g. an
         # item under a collection) wins over its shorter ancestors.
         ark_prefix = (
@@ -166,12 +178,27 @@ def resolve_ark(request, ark: str):
             .first()
         )
         if ark_prefix:
+            # The ancestor was matched without hyphens, so measure it that way
+            # and cut the requested string at the same significant character.
+            ancestor_name = ark_prefix.ark.removeprefix(f"{naan}/")
+            _, suffix = split_after_normalized(
+                identifier, len(strip_hyphens(ancestor_name))
+            )
+            # An inflection asks this resolver for metadata, and arklet is the
+            # end of the chain: there is no downstream service to forward the
+            # request to. Answer with the nearest registered ancestor's
+            # metadata, labelled with the ark that was actually requested, so
+            # that metadata stays available at sub-resource granularity even
+            # though only the ancestor was minted.
+            if info_inflection:
+                return view_ark(request, ark_prefix, requested_ark=ark_str, suffix=suffix)
+            if json_inflection:
+                return json_ark(request, ark_prefix, requested_ark=ark_str, suffix=suffix)
             if not ark_prefix.url:
                 # No target to pass the suffix through to, so describe the
                 # nearest registered ancestor instead of redirecting to a
                 # relative path built from an empty url.
-                return view_ark(request, ark_prefix)
-            suffix = ark_str.removeprefix(ark_prefix.ark)
+                return view_ark(request, ark_prefix, requested_ark=ark_str, suffix=suffix)
             return HttpResponseRedirect(ark_prefix.url + suffix)
         else:
             if info_inflection or json_inflection:
@@ -186,14 +213,27 @@ def resolve_ark(request, ark: str):
             except Naan.DoesNotExist:
                 return HttpResponseNotFound(f"naan {naan} is unknown to this resolver.")
 
+def resolved_url(ark: Ark, suffix: str = "") -> str:
+    """Where the requested ark resolves to.
+
+    For a suffixed request this is the ancestor's url with the suffix appended,
+    which is exactly the Location a plain (uninflected) request would receive.
+    An ark reserved without a url keeps an empty url rather than degrading to a
+    bare suffix.
+    """
+    if suffix and ark.url:
+        return f"{ark.url}{suffix}"
+    return ark.url
+
+
 """
 Return HTML human readable webpage information about the Ark object
 """
-def view_ark(request: HttpRequest, ark: Ark):
+def view_ark(request: HttpRequest, ark: Ark, requested_ark: str = None, suffix: str = ""):
 
     context = {
-        'ark': ark.ark,
-        'url': ark.url,
+        'ark': requested_ark or ark.ark,
+        'url': resolved_url(ark, suffix),
         'label': ark.title,
         'type': ark.type,
         'commitment': ark.commitment,
@@ -201,7 +241,9 @@ def view_ark(request: HttpRequest, ark: Ark):
         'format': ark.format,
         'relation': ark.relation,
         'source': ark.source,
-        'metadata': ark.metadata
+        'metadata': ark.metadata,
+        'inherited_from': ark.ark if suffix else "",
+        'suffix': suffix,
     }
 
     return render(request, 'info.html', context)
@@ -209,10 +251,17 @@ def view_ark(request: HttpRequest, ark: Ark):
 """
 Return the Ark object as JSON
 """
-def ark_to_json(ark: Ark, metadata=True):
+def ark_to_json(ark: Ark, metadata=True, requested_ark: str = None, suffix: str = ""):
+    """Serialize an ark, optionally as the answer for a suffixed descendant.
+
+    When `suffix` is set the record describes `requested_ark` while the values
+    are inherited from `ark`, the nearest registered ancestor. `inherited_from`
+    and `suffix` are only present in that case, so exact-match responses and the
+    mint/update/bulk payloads keep their existing shape.
+    """
     data = {
-        'ark': ark.ark,
-        'url': ark.url,
+        'ark': requested_ark or ark.ark,
+        'url': resolved_url(ark, suffix),
         'title': ark.title,
         'type': ark.type,
         'commitment': ark.commitment,
@@ -222,16 +271,22 @@ def ark_to_json(ark: Ark, metadata=True):
         'source': ark.source,
         'metadata': ark.metadata
     }
+    if suffix:
+        data['inherited_from'] = ark.ark
+        data['suffix'] = suffix
     if not metadata:
         return data
     obj = {}
     for key in data:
-        obj[key] = Ark.COLUMN_METADATA.get(key, {})
+        # Copy: COLUMN_METADATA is class level, so writing 'value' into the
+        # dict it returns would leak this ark's values into every later
+        # response.
+        obj[key] = dict(Ark.COLUMN_METADATA.get(key, {}))
         obj[key]['value'] = data[key]
     return obj
 
-def json_ark(request: HttpRequest, ark: Ark):
-    obj = ark_to_json(ark)
+def json_ark(request: HttpRequest, ark: Ark, requested_ark: str = None, suffix: str = ""):
+    obj = ark_to_json(ark, requested_ark=requested_ark, suffix=suffix)
     # Return the JSON response
     return JsonResponse(obj)
 
